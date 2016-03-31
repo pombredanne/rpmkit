@@ -1,5 +1,5 @@
 #
-# Copyright (C) 2013 Red Hat, Inc.
+# Copyright (C) 2013 - 2015 Red Hat, Inc.
 # Red Hat Author(s): Satoru SATOH <ssato@redhat.com>
 #
 # This program is free software: you can redistribute it and/or modify
@@ -17,6 +17,7 @@
 #
 from logging import DEBUG, INFO
 from itertools import count
+# from memory_profiler import profile
 
 import rpmkit.memoize as RM
 import rpmkit.rpmutils as RU
@@ -42,6 +43,7 @@ _GV_ENGINE = "sfdp"   # or neato, twopi, ...
 _GV_ENGINES = ("dot", "neato", "twopi", "circo", "fdp", "sfdp")
 
 
+# @profile
 def _make_dependency_graph(root, reversed=True, rreqs=None,
                            edge_attrs=_E_ATTRS):
     """
@@ -176,7 +178,7 @@ def make_dependencies_dag(root, reqs=None, rreqs=None):
     g = make_dependency_graph(root, rreqs=rreqs)
 
     # Degenerate strongly connected components:
-    for scc in NX.strongly_connected_components(g):
+    for scc in list(NX.strongly_connected_components(g)):
         scc = sorted(U.uniq(scc))  # TODO: Is this needed?
 
         if len(scc) == 1:  # Ignore sccs of which length is 1.
@@ -453,7 +455,9 @@ def main(argv=sys.argv):
     p = option_parser()
     (options, args) = p.parse_args(argv[1:])
 
-    logging.getLogger().setLevel(DEBUG if options.verbose else INFO)
+    fmt = "%(asctime)s %(name)s: [%(levelname)s] %(message)s"
+    logging.basicConfig(level=DEBUG if options.verbose else INFO, format=fmt)
+
     dump_graphs(options.root, options.workdir, options.tpaths, options.html)
 
     logging.info("Make dependency graph and dump it with graphviz")

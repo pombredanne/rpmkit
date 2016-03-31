@@ -1,31 +1,64 @@
 #
-# Copyright (C) 2014 Red Hat, Inc.
+# Copyright (C) 2014, 2015 Red Hat, Inc.
 # Author: Satoru SATOH <ssato@redhat.com>
 # License: GPLv3+
 #
 from __future__ import print_function
-from gi.repository import Libosinfo as osinfo
+
+try:
+    import gi
+    gi.require_version('Libosinfo', '1.0')
+    from gi.repository import Libosinfo as osinfo
+except ImportError:
+    osinfo = None
+
 from logging import DEBUG, INFO
+
+import anyconfig
+import bisect
+import collections
+import datetime
+import exceptions
+import gzip
+import itertools
+import logging
+import operator
+import optparse
+import os.path
+import re
+import requests
+import sys
+import tempfile
+
+try:
+    import cStringIO as StringIO
+except ImportError:
+    import StringIO
+
+try:
+    # First, try lxml which is compatible with elementtree and looks faster a
+    # lot. See also: http://getpython3.com/diveintopython3/xml.html
+    from lxml2 import etree as ET
+except ImportError:
+    try:
+        import xml.etree.ElementTree as ET
+    except ImportError:
+        import elementtree.ElementTree as ET
+
+try:
+    import yum
+    _YUMVARS = yum.YumBase().conf.yumvar
+except ImportError:
+    _YUMVARS = dict(releasever=None, basearch="x86_64")
 
 import rpmkit.swapi
 import rpmkit.rpmutils
 import rpmkit.utils
 
-import anyconfig
-import collections
-import datetime
-import exceptions
-import itertools
-import logging
-import optparse
-import os.path
-import re
-import sys
-import tempfile
-
 
 _TODAY = datetime.datetime.now().strftime("%Y-%m-%d")
 _ES_FMT = "%(advisory)s,%(synopsis)s,%(issue_date)s"
+LOG = logging.getLogger(__name__)
 
 
 def prev_date(date_s):
@@ -47,6 +80,9 @@ def init_osinfo(path=None):
     :param path: libosinfo distro data
     :return: an osinfo.Db instance
     """
+    if osinfo is None:
+        return None
+
     loader = osinfo.Loader()
     if path is None:
         loader.process_default_path()
@@ -79,11 +115,22 @@ def get_distro_release_date(distro, version, release=0):
     """
     see also: https://access.redhat.com/articles/3078 (rhel)
 
-    >>> get_distro_release_date("rhel", 5, 4)
-    '2009-09-02'
+    >>> try:
+    ...     get_distro_release_date("rhel", 5, 4) == '2009-09-02'
+    ... except RuntimeError as exc:
+    ...     True
+    True
     """
     db = init_osinfo()
+    if db is None:
+        raise RuntimeError("Libosinfo initialization failed")
+
     osi = db.get_os(get_osid(distro, version, release))
+
+    if osi is None:
+        raise RuntimeError("Not found: distro={}, version={}, "
+                           "release={}".format(distro, version, release))
+
     return osi.get_param_value("release-date")
 
 
@@ -145,6 +192,103 @@ def get_errata_list_from_rhns(channel, period, details=False, list_pkgs=False,
         es = [errata_add_relevant_package_list(e, rps, swopts) for e in es]
 
     return es
+
+
+def expand_baseurl_in_repofile(baseurl, relver=None, yumvars=_YUMVARS):
+    """
+    Expand yum variables in baseurl string from yum .repo files.
+    """
+    relver = yumvars.get("releasever", relver)
+    if not relver:
+        relver = "7Server"  # FIXME
+    basearch = yumvars.get("basearch", "x86_64")
+
+    return re.sub(r"\$basearch", basearch,
+                  re.sub(r"\$releasever", relver, baseurl))
+
+
+def updateinfo_xml_itr(updateinfo):
+    """
+    :param updateinfo: the content of updateinfo.xml :: str
+    """
+    root = ET.ElementTree(ET.fromstring(updateinfo)).getroot()
+    for upd in root.findall("update"):
+        uinfo = upd.attrib
+        for k in "id title severity rights summary description".split():
+            elem = upd.find(k)
+            if elem is not None:
+                uinfo[k] = elem.text
+
+        for k in "issued updated".split():
+            uinfo[k] = upd.find(k).attrib["date"]
+        uinfo["refs"] = [r.attrib for r in upd.findall(".//reference")]
+        uinfo["packages"] = [dict(filename=p.find("filename").text, **p.attrib)
+                             for p in upd.findall(".//package")]
+        yield uinfo
+
+
+def get_errata_list_from_updateinfo_by_repofile(rid, basearch="x86_64"):
+    """
+    Try to fetch the content of given repo metadata xml from remote.
+
+    :param rid: ID of the repo from RH CDN, ex. rhel-7-server-rpms
+    """
+    timeout = 60 * 5
+    try:
+        repos = anyconfig.load("/etc/yum.repos.d/*.repo", ac_parser="ini")
+        repo = repos.get(rid, None)
+        if repo is None:
+            LOG.error("Failed to get repo info: %r", rid)
+            return None
+
+        rparams = dict(timeout=timeout)
+        if "sslclientcert" in repo and "sslclientkey" in repo:
+            rparams["cert"] = (repo["sslclientcert"], repo["sslclientkey"])
+
+        if "sslcacert" in repo:
+            rparams["verify"] = repo["sslcacert"]
+
+        try:
+            m = re.match(r"Red Hat Enterprise Linux (\d+) .*", repo["name"])
+            relver = "%dServer" % int(m.groups()[0]) if m else "7Server"
+        except (AttributeError, IndexError):
+            relver = None
+
+        baseurl = expand_baseurl_in_repofile(repo["baseurl"], relver)
+        repomd_xml_url = os.path.join(baseurl, "repodata/repomd.xml")
+
+        LOG.info("Try to fetch repomd.xml: %s", repomd_xml_url)
+        resp = requests.get(repomd_xml_url, **rparams)
+        if not resp.ok:
+            LOG.error("Failed to get repomd.xml from %s", baseurl)
+            return None
+
+        LOG.debug("Try to parse repomd.xml...")
+        root = ET.ElementTree(ET.fromstring(resp.text)).getroot()
+
+        ns = "http://linux.duke.edu/metadata/repo"
+        es = root.findall(".//{%s}location" % ns)
+        us = [e.attrib["href"] for e in es if "updateinfo.xml"
+              in e.attrib["href"]]
+        if not us:
+            LOG.error("Failed to find the url %s", repomd_xml_url)
+            return None
+
+        upd_url = os.path.join(baseurl, us[0])
+
+        LOG.debug("Try to fetch updateinfo.xml: %s", upd_url)
+        resp = requests.get(upd_url, **rparams)
+
+        if not resp.ok:
+            LOG.error("Failed to get updateinfo.xml from %s", upd_url)
+            return None
+
+        updgz = resp.content
+        uinfo = gzip.GzipFile(fileobj=StringIO.StringIO(updgz)).read()
+        return sorted(updateinfo_xml_itr(uinfo),
+                      key=operator.itemgetter("issued"))
+    except Exception as exc:
+        raise RuntimeError("Failed: exc=%r" % exc)
 
 
 def dicts_eq(lhs, rhs, strict=False):
@@ -272,7 +416,7 @@ def distro_guess_checksum_type(distro):
         return "sha256"
 
 
-def distro_resolve_release_dates(distro):
+def distro_resolve_release_dates(distro, prev=True):
     """
     :param distro: A dict represents OS distribution
     """
@@ -288,7 +432,8 @@ def distro_resolve_release_dates(distro):
                                                       distro["releases"][1],
                                                       distro["arch"],
                                                       end))
-        period.append(prev_date(end))
+        # No need to compute prev. date if bisect.bisect_left is used.
+        period.append(prev_date(end) if prev else end)
         logging.info("period: {}..{}".format(*period))
 
     return period
@@ -312,7 +457,7 @@ def guess_rhns_channels_by_distro(distro):
     return []
 
 
-def distro_new(distro_s, arch="x86_64", channels=[]):
+def distro_new_by_rhns(distro_s, arch="x86_64", channels=[]):
     """
     :param distro_s: A string represents distribution,
         ex. 'rhel-6.5-x86_64', 'fedora-20'
@@ -330,6 +475,20 @@ def distro_new(distro_s, arch="x86_64", channels=[]):
     distro["checksum_type"] = distro_guess_checksum_type(distro)
     distro["period"] = distro_resolve_release_dates(distro)
 
+    return distro
+
+
+def distro_new(distro_s, arch="x86_64"):
+    """
+    :param distro_s: A string represents distribution,
+        ex. 'rhel-6.5-x86_64', 'fedora-20'
+    :param arch: Default architecture
+    """
+    distro = parse_distro(distro_s, arch)
+    distro["period"] = distro_resolve_release_dates(distro, prev=False)
+    distro["repoid"] = "rhel-%(version)d-server-rpms" % distro
+    distro["channels"] = [distro["repoid"]]
+    distro["checksum_type"] = "sha256"
     return distro
 
 
@@ -429,17 +588,19 @@ def output_results(errata, packages, updates, distro, workdir):
 
     with open(os.path.join(workdir, "updates.txt"), 'w') as f:
         for u in updates:
-            f.write(u["path"] + '\n')
+            f.write(u.get("path", u.get("filename", "N/A")) + '\n')
 
     with open(os.path.join(workdir, "errata.csv"), 'w') as f:
         f.write("advisory,synopsis,issue_date,url\n")
         for e in errata:
-            adv = e["advisory"]
+            adv = e.get("advisory", e.get("id"))
             adv_s = adv.replace(':', '-')
             url = "https://rhn.redhat.com/errata/{}.html".format(adv_s)
 
-            f.write("{},{},{},{}\n".format(adv, e["synopsis"],
-                                           e["issue_date"], url))
+            f.write("{},{},{},{}\n".format(adv,
+                                           e.get("synopsis", e.get("title")),
+                                           e.get("issue_date",
+                                                 e.get("issued")), url))
 
     fn = os.path.join(workdir, "geniso.sh")
     with open(fn, 'w') as f:
@@ -459,11 +620,14 @@ def option_parser():
                    "rhel-5.4..5-x86_64" means "from rhel-5.4-x86_64 to
                    rhel-5.5-x86_64"."""
     defaults = dict(download=False, workdir=None, channels=[], arch="x86_64",
-                    all_versions=False, swopts=[], verbose=False)
+                    all_versions=False, swopts=[], rhns=False,
+                    verbose=False)
 
     p = optparse.OptionParser(usage)
     p.set_defaults(**defaults)
 
+    p.add_option("-R", "--rhns", action="store_true",
+                 help="Use classic RHN / Satellite API to fetch info")
     p.add_option("-d", "--download", action="store_true",
                  help="Download errata packages (Not implemented yet)")
     p.add_option("-w", "--workdir", help="Working dir to save results")
@@ -490,10 +654,27 @@ def main():
         p.print_help()
         sys.exit(1)
 
-    distro = distro_new(args[0], options.arch, options.channels)
-    errata = list_errata_from_rhns(distro, options.swopts)
-    packages = list_errata_packages(errata, options.swopts)
-    updates = rpmkit.rpmutils.find_latests(packages, ("name", "arch_label"))
+    if options.rhns:
+        distro = distro_new_by_rhns(args[0], options.arch, options.channels)
+        errata = list_errata_from_rhns(distro, options.swopts)
+        packages = list_errata_packages(errata, options.swopts)
+        updates = rpmkit.rpmutils.find_latests(packages, ("name", "arch_label"))
+    else:
+        distro = distro_new(args[0], options.arch)
+        # basearch = distro["arch"]  # TBD.
+        aes = get_errata_list_from_updateinfo_by_repofile(distro["repoid"])
+
+        LOG.info("Filter errata in the period: %s", "~".join(distro["period"]))
+        edates = [e["issued"] for e in aes]
+        ebegin = bisect.bisect_left(edates, distro["period"][0])
+        if len(distro["period"]) > 1:
+            eend = bisect.bisect_left(edates, distro["period"][1], ebegin)
+            errata = aes[ebegin:eend]
+        else:
+            errata = aes[ebegin:]
+
+        packages = list_errata_packages(errata)
+        updates = rpmkit.rpmutils.find_latests(packages, ("name", "arch"))
 
     if options.workdir:
         workdir = options.workdir

@@ -11,7 +11,6 @@
 from rpmkit.globals import _
 from operator import itemgetter
 
-import rpmkit.updateinfo.yumwrapper
 import rpmkit.updateinfo.yumbase
 import rpmkit.updateinfo.dnfbase
 import rpmkit.updateinfo.utils
@@ -26,6 +25,7 @@ import bunch
 import calendar
 import collections
 import datetime
+import functools
 import itertools
 import logging
 import os
@@ -33,6 +33,19 @@ import os.path
 import re
 import tablib
 
+if os.environ.get("RPMKIT_MEMORY_DEBUG", False):
+    try:
+        from memory_profiler import profile
+    except ImportError:
+        def profile(fn):
+            def wrapper(*args, **kwargs):
+                return fn(*args, **kwargs)
+            return functools.wraps(fn)(wrapper)
+else:
+    def profile(fn):
+        def wrapper(*args, **kwargs):
+            return fn(*args, **kwargs)
+        return functools.wraps(fn)(wrapper)
 
 LOG = logging.getLogger("rpmkit.updateinfo")
 
@@ -40,10 +53,9 @@ _RPM_LIST_FILE = "packages.json"
 _ERRATA_LIST_FILE = "errata.json"
 _UPDATES_LIST_FILE = "updates.json"
 
-BACKENDS = dict(yumwrapper=rpmkit.updateinfo.yumwrapper.Base,
-                yumbase=rpmkit.updateinfo.yumbase.Base,
-                dnfbase=rpmkit.updateinfo.dnfbase.Base)
-DEFAULT_BACKEND = BACKENDS["yumbase"]
+BACKENDS = dict(yum=rpmkit.updateinfo.yumbase.Base,
+                dnf=rpmkit.updateinfo.dnfbase.Base)
+DEFAULT_BACKEND = BACKENDS["yum"]
 
 NEVRA_KEYS = ["name", "epoch", "version", "release", "arch"]
 
@@ -69,7 +81,6 @@ def set_loglevel(verbosity=0, backend=False):
     if not backend:
         llvl = logging.WARN
 
-    rpmkit.updateinfo.yumwrapper.LOG.setLevel(llvl)
     rpmkit.updateinfo.yumbase.LOG.setLevel(llvl)
     rpmkit.updateinfo.dnfbase.LOG.setLevel(llvl)
 
@@ -282,7 +293,7 @@ _RHSA_SEVERITIES = collections.defaultdict(int,
                                            dict(Low=2, Moderate=4,
                                                 Important=6, Critical=8))
 _E2I_REG = re.compile(r"^RH(?P<echar>(E|B|S))A-(?P<year>\d{4}):"
-                      "(?P<seq>\d{4})(?:-(?P<rev>\d+))?$")
+                      "(?P<seq>\d{4,5})(?:-(?P<rev>\d+))?$")
 
 
 def errata_to_int(errata, echars=_ERRATA_CHARS, severities=_RHSA_SEVERITIES,
@@ -876,9 +887,11 @@ def dump_results(workdir, rpms, errata, updates, score=0,
 
 def get_backend(backend, fallback=rpmkit.updateinfo.yumbase.Base,
                 backends=BACKENDS):
+    LOG.info("Using the backend: %s", backend)
     return backends.get(backend, fallback)
 
 
+@profile
 def prepare(root, workdir=None, repos=[], did=None, cachedir=None,
             backend=DEFAULT_BACKEND, backends=BACKENDS,
             nevra_keys=NEVRA_KEYS):
@@ -974,6 +987,7 @@ def errata_in_period(errata, start_date, end_date):
     return start_date <= d and d < end_date
 
 
+@profile
 def analyze(host, score=0, keywords=ERRATA_KEYWORDS, core_rpms=[],
             period=(), refdir=None, nevra_keys=NEVRA_KEYS):
     """
